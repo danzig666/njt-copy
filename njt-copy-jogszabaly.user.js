@@ -1,8 +1,8 @@
 ﻿// ==UserScript==
 // @name         NJT Copy jogszabály to Word
-// @namespace    https://github.com/example/njt-copy
-// @version      1.0.2
-// @description  NJT-jogszabályok másolása Wordbe illeszthető formázással és egyszerű szövegként.
+// @namespace    https://github.com/danzig666/njt-copy
+// @version      1.1.0
+// @description  NJT-jogszabályok teljes szövegének automatikus betöltése (Ctrl+F-hez) és másolása Wordbe illeszthető formázással és egyszerű szövegként.
 // @homepageURL  https://github.com/danzig666/njt-copy
 // @downloadURL  https://raw.githubusercontent.com/danzig666/njt-copy/main/njt-copy-jogszabaly.user.js
 // @updateURL    https://raw.githubusercontent.com/danzig666/njt-copy/main/njt-copy-jogszabaly.user.js
@@ -141,38 +141,39 @@
         'sup[data-note-id]',
     ];
 
-    /** Scroll step in pixels when traversing the page for lazy-loaded content */
-    var SCROLL_STEP_PX = 2000;
+    /** Lazy-loaded block placeholders the site fills in on scroll */
+    var UNLOADED_BLOCK_SELECTOR = '#jogszab div.pH.borderStart';
 
-    /** Wait between scroll steps (ms) */
-    var SCROLL_WAIT_MS = 50;
+    /** Max attempts to load all blocks, and wait between failed attempts (ms) */
+    var LOAD_MAX_TRIES = 40;
+    var LOAD_RETRY_MS = 500;
 
-    /** Maximum number of consecutive no-change checks before stopping scroll */
-    var MAX_NO_CHANGE_CHECKS = 8;
+    /** Give up on a single site block request after this long (ms) */
+    var LOAD_REQUEST_TIMEOUT_MS = 60000;
 
-    /** Maximum total scroll attempts (safety limit) */
-    var MAX_SCROLL_ATTEMPTS = 200;
+    /** Max clipboard retries on NotAllowedError while the tab has focus */
+    var CLIPBOARD_MAX_RETRIES = 10;
 
-    /** Base URL for resolving relative links (inferred from <base> tag or location) */
-    var BASE_URL = (function () {
+    /** Base URL for resolving relative links (from <base> tag or location).
+     *  Computed lazily: at document-start the <base> tag is not parsed yet. */
+    function getBaseUrl() {
         var b = document.querySelector('base[href]');
         if (b) {
-            // ensure absolute
             var u = b.getAttribute('href');
             if (u) return new URL(u, location.origin).href.replace(/\/$/, '');
         }
         return location.origin;
-    })();
+    }
 
     // -----------------------------------------------------------------------
     // Utility helpers
     // -----------------------------------------------------------------------
 
-    /** Resolve a potentially relative URL to absolute, using BASE_URL */
+    /** Resolve a potentially relative URL to absolute, using getBaseUrl() */
     function toAbsoluteUrl(url) {
         if (!url) return url;
         try {
-            return new URL(url, BASE_URL).href;
+            return new URL(url, getBaseUrl()).href;
         } catch (e) {
             return url;
         }
@@ -208,124 +209,110 @@
         return best;
     }
 
-    /** Get the main scroll container (element with overflow, or window) */
-    function getScrollContainer() {
-        // Check common scrollable containers
-        var candidates = [
-            document.querySelector('.jogszabaly-wrapper'),
-            document.querySelector('.mainContent'),
-            document.querySelector('.content.wrapper'),
-            document.querySelector('#main'),
-            document.querySelector('#jogszabaly-reader'),
-            document.querySelector('.mainWrapper'),
-        ];
-        for (var i = 0; i < candidates.length; i++) {
-            var el = candidates[i];
-            if (!el) continue;
-            var s = window.getComputedStyle(el);
-            if (s.overflowY === 'auto' || s.overflowY === 'scroll' || s.overflow === 'auto' || s.overflow === 'scroll') {
-                if (el.scrollHeight > el.clientHeight + 10) return el;
+    // -----------------------------------------------------------------------
+    // Full-text loading: the site renders large laws as placeholder blocks
+    // (div.pH.borderStart) and fetches them from /ajax/njtGetBlock.json as
+    // they scroll into view.  The site's own jogszabalyLoader.loadAllEmptyBlock()
+    // fetches every missing block in one request without scrolling.
+    // -----------------------------------------------------------------------
+
+    function hasUnloadedBlocks() {
+        return !!document.querySelector(UNLOADED_BLOCK_SELECTOR);
+    }
+
+    /** True once the site's loader has been initialised for the law in the URL
+     *  (after Angular navigation it briefly still points at the previous law). */
+    function siteLoaderReady() {
+        var loader = window.jogszabalyLoader;
+        var cfg = window.docConfig;
+        if (!loader || typeof loader.loadAllEmptyBlock !== 'function' || !cfg) return false;
+        var docId = String(cfg.currentJogszabalyVersion || '').split(/[.;]/)[0];
+        return !!docId && location.pathname.indexOf(docId) !== -1;
+    }
+
+    /** One loadAllEmptyBlock() round.  Resolves when the site's callback fires;
+     *  rejects if the loader is not ready, throws, or never calls back. */
+    function loadBlocksOnce() {
+        return new Promise(function (resolve, reject) {
+            if (!siteLoaderReady()) {
+                reject(new Error('Site loader not ready'));
+                return;
             }
-        }
-        return null; // signals window scrolling
+            var settled = false;
+            var timer = setTimeout(function () {
+                finish(new Error('Block request timed out'));
+            }, LOAD_REQUEST_TIMEOUT_MS);
+            function finish(err) {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                if (err) reject(err); else resolve();
+            }
+            try {
+                window.jogszabalyLoader.loadAllEmptyBlock(function () { finish(); });
+            } catch (e) {
+                // The loader started the site's spinner before throwing
+                try { window.loadIndicator.stopLoading(); } catch (e2) {}
+                finish(e);
+            }
+        });
     }
 
-    // -----------------------------------------------------------------------
-    // Lazy-load forcing: scroll through the entire page so virtual/dynamic
-    // content gets rendered before we clone.
-    // -----------------------------------------------------------------------
-
-    /** Returns total scrollable height (clientHeight for container, documentHeight for window) */
-    function getTotalHeight(container) {
-        if (container) return container.scrollHeight;
-        return Math.max(
-            document.documentElement.scrollHeight,
-            document.body.scrollHeight,
-            document.documentElement.offsetHeight,
-            document.body.offsetHeight
-        );
-    }
-
-    /** Returns current scroll position */
-    function getScrollPos(container) {
-        if (container) return container.scrollTop;
-        return window.pageYOffset || document.documentElement.scrollTop || document.body.scrollTop || 0;
-    }
-
-    /** Sets scroll position */
-    function setScrollPos(container, pos) {
-        if (container) {
-            container.scrollTop = pos;
-        } else {
-            window.scrollTo(0, pos);
-        }
-    }
+    var fullLoadPromise = null;
+    var fullLoadPath = null;
+    var fullLoadFailedPath = null;
 
     /**
-     * Scroll through the full content slowly to trigger lazy-loading.
-     * Returns a Promise that resolves when done.
+     * Load every lazy block of the current law without scrolling.
+     * Concurrent callers share one in-flight Promise.
      */
-    function ensureAllContentLoaded(container) {
-        return new Promise(function (resolve) {
-            var origPos = getScrollPos(container);
-            var totalHeight = getTotalHeight(container);
-            var currentPos = 0;
-            var noChangeCount = 0;
-            var lastHeight = totalHeight;
-            var attempts = 0;
+    function ensureFullTextLoaded() {
+        if (fullLoadPromise && fullLoadPath === location.pathname) return fullLoadPromise;
+        var path = location.pathname;
+        fullLoadPath = path;
 
-            function step() {
-                attempts++;
-                if (attempts > MAX_SCROLL_ATTEMPTS) {
-                    // Safety: stop trying
-                    finalize();
+        var p = new Promise(function (resolve, reject) {
+            var tries = 0;
+            (function attempt() {
+                if (location.pathname !== path) {
+                    reject(new Error('Az oldal közben megváltozott.'));
                     return;
                 }
-
-                // Scroll down one step
-                currentPos += SCROLL_STEP_PX;
-                setScrollPos(container, currentPos);
-
-                // After a brief wait, check if content grew
-                setTimeout(function () {
-                    var newHeight = getTotalHeight(container);
-
-                    if (newHeight > lastHeight) {
-                        // Content expanded - reset no-change counter,
-                        // extend our target, and keep going
-                        noChangeCount = 0;
-                        lastHeight = newHeight;
-                        totalHeight = newHeight;
-                    } else if (currentPos >= totalHeight - (container ? container.clientHeight : window.innerHeight)) {
-                        // We've scrolled to/past the bottom
-                        noChangeCount++;
-                    } else {
-                        // Still scrolling through known content
-                        noChangeCount = 0;
-                    }
-
-                    if (noChangeCount >= MAX_NO_CHANGE_CHECKS) {
-                        // No new content for several checks after reaching bottom
-                        finalize();
-                    } else if (currentPos >= totalHeight && noChangeCount > 0) {
-                        // At/past the end, keep checking for a bit
-                        setTimeout(step, SCROLL_WAIT_MS);
-                    } else {
-                        step();
-                    }
-                }, SCROLL_WAIT_MS);
-            }
-
-            function finalize() {
-                // Restore original position
-                setScrollPos(container, origPos);
-                resolve();
-            }
-
-            // Start at top
-            setScrollPos(container, 0);
-            step();
+                if (!hasUnloadedBlocks()) {
+                    resolve();
+                    return;
+                }
+                if (++tries > LOAD_MAX_TRIES) {
+                    reject(new Error('Nem sikerült a teljes szöveget betölteni.'));
+                    return;
+                }
+                // Blocks already requested by the site's scroll handler are
+                // skipped by loadAllEmptyBlock, so loop until none remain.
+                loadBlocksOnce().then(function () {
+                    setTimeout(attempt, 100);
+                }, function () {
+                    setTimeout(attempt, LOAD_RETRY_MS);
+                });
+            })();
         });
+
+        fullLoadPromise = p;
+        p.then(function () {
+            if (fullLoadPromise === p) fullLoadPromise = null;
+        }, function (err) {
+            if (fullLoadPromise === p) fullLoadPromise = null;
+            if (location.pathname === path) fullLoadFailedPath = path;
+            console.warn('[NJT Copy] Full-text load failed:', err);
+        });
+        return p;
+    }
+
+    /** Background auto-load on law pages, so Ctrl+F searches the whole text */
+    function autoLoadFullText() {
+        if (!/\/jogszabaly\//.test(location.pathname)) return;
+        if (fullLoadFailedPath === location.pathname) return;  // don't hammer after giving up
+        if (!hasUnloadedBlocks()) return;
+        ensureFullTextLoaded().catch(function () {});
     }
 
     // -----------------------------------------------------------------------
@@ -852,65 +839,6 @@
     }
 
     // -----------------------------------------------------------------------
-    // Clipboard operations
-    // -----------------------------------------------------------------------
-
-    /**
-     * Copy HTML and plain text to clipboard.
-     * Uses execCommand('copy') first because it triggers the browser's
-     * native clipboard write (same as Ctrl+C), which produces the exact
-     * CF_HTML format Word expects.  ClipboardItem is the fallback.
-     */
-    function copyToClipboard(htmlContent, plainText) {
-        // PRIMARY: execCommand on a hidden contenteditable — this is
-        // the same mechanism the browser uses for Ctrl+C, producing
-        // properly formatted CF_HTML that Word recognizes.
-        try {
-            var container = document.createElement('div');
-            container.setAttribute('contenteditable', 'true');
-            container.style.cssText = 'position:fixed;left:-9999px;top:0;width:1px;height:1px;overflow:hidden;opacity:0;';
-            container.innerHTML = htmlContent;
-            document.body.appendChild(container);
-
-            var range = document.createRange();
-            range.selectNodeContents(container);
-            var sel = window.getSelection();
-            sel.removeAllRanges();
-            sel.addRange(range);
-
-            var success = document.execCommand('copy');
-            sel.removeAllRanges();
-            document.body.removeChild(container);
-
-            if (success) return Promise.resolve();
-        } catch (e) {
-            // fall through to ClipboardItem
-        }
-
-        // FALLBACK: ClipboardItem API
-        if (typeof ClipboardItem === 'function' && navigator.clipboard && navigator.clipboard.write) {
-            var blobHtml = new Blob([htmlContent], { type: 'text/html' });
-            var blobText = new Blob([plainText], { type: 'text/plain' });
-            try {
-                var item = new ClipboardItem({
-                    'text/html': blobHtml,
-                    'text/plain': blobText,
-                });
-                return navigator.clipboard.write([item]);
-            } catch (e2) {
-                try {
-                    var item2 = new ClipboardItem({ 'text/html': blobHtml });
-                    return navigator.clipboard.write([item2]);
-                } catch (e3) {
-                    return Promise.reject(new Error('Clipboard write failed: ' + e3.message));
-                }
-            }
-        }
-
-        return Promise.reject(new Error('No clipboard method available'));
-    }
-
-    // -----------------------------------------------------------------------
     // UI: Button and progress indicator
     // -----------------------------------------------------------------------
 
@@ -1031,11 +959,8 @@
         setButtonProgress(true);
         showToast('Teljes szöveg betöltése...');
 
-        // Step 1: find the scroll container
-        var scrollContainer = getScrollContainer();
-
-        // Step 2: scroll through full content to trigger any lazy-loading
-        ensureAllContentLoaded(scrollContainer)
+        // Step 1-2: fetch every lazy-loaded block (no scrolling)
+        ensureFullTextLoaded()
             .then(function () {
                 showToast('Szöveg feldolgozása...');
 
@@ -1056,7 +981,7 @@
                 var cleaned = cleanContent(contentEl);
 
                 // Step 6: copy via ClipboardItem API.  If the tab lost
-                // focus while scrolling (user switched away), wait for
+                // focus while loading (user switched away), wait for
                 // focus to return before writing.
                 showToast('Másolás vágólapra...');
                 var contentHtml = cleaned.outerHTML || cleaned.innerHTML;
@@ -1075,6 +1000,7 @@
 
                 // Promise-based retry loop with focus detection
                 return new Promise(function (resolve, reject) {
+                    var retries = 0;
                     function tryWrite() {
                         if (!document.hasFocus()) {
                             showToast('Válts vissza erre a fülre a másoláshoz...');
@@ -1088,7 +1014,7 @@
                             return;
                         }
                         navigator.clipboard.write([item]).then(resolve, function (err) {
-                            if (err.name === 'NotAllowedError') {
+                            if (err.name === 'NotAllowedError' && ++retries <= CLIPBOARD_MAX_RETRIES) {
                                 // Document lost focus between check and write — retry
                                 setTimeout(tryWrite, 500);
                             } else {
@@ -1125,6 +1051,7 @@
         lastUrl = location.href;
         initRun = false;           // reset for new page
         initRetries = 0;
+        fullLoadFailedPath = null;
 
         var oldBtn = document.getElementById(BUTTON_ID);
         if (oldBtn && oldBtn.parentNode) oldBtn.parentNode.removeChild(oldBtn);
@@ -1179,6 +1106,7 @@
         getOrCreateButton();
         getOrCreateToast();
         initRun = true;
+        autoLoadFullText();
     }
 
     // Wait for DOM ready because Tampermonkey starts us at document-start.
@@ -1206,7 +1134,7 @@
                         var tag = node.tagName.toUpperCase();
                         var cls = (node.getAttribute('class') || '').toLowerCase();
                         // Site wraps selection in <span> with highlight styling
-                        if (tag === 'SPAN' && (cls.indexOf('highlight') !== -1 ||
+                        if (node.parentNode && tag === 'SPAN' && (cls.indexOf('highlight') !== -1 ||
                             (node.getAttribute('style') || '').indexOf('#DCEFFD') !== -1)) {
                             // Unwrap: move children out, remove span
                             while (node.firstChild) {
@@ -1217,12 +1145,14 @@
                     }
                 }
             }
-            // Original button-creation logic
-            var contentEl = findContentElement();
-            if (contentEl && !document.getElementById(BUTTON_ID) && /\/jogszabaly\//.test(location.pathname)) {
+            // Button creation + auto-load.  Path check first: findContentElement()
+            // falls back to a full-page text scan, too slow for every mutation.
+            if (!/\/jogszabaly\//.test(location.pathname)) return;
+            if (!document.getElementById(BUTTON_ID) && findContentElement()) {
                 getOrCreateButton();
                 getOrCreateToast();
             }
+            autoLoadFullText();
         });
         bodyObserver.observe(document.body, { childList: true, subtree: true });
     }
