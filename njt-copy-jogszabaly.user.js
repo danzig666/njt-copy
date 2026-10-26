@@ -1,8 +1,8 @@
 ﻿// ==UserScript==
 // @name         NJT Copy jogszabály to Word
 // @namespace    https://github.com/danzig666/njt-copy
-// @version      1.1.0
-// @description  NJT-jogszabályok teljes szövegének automatikus betöltése (Ctrl+F-hez) és másolása Wordbe illeszthető formázással és egyszerű szövegként.
+// @version      1.2.0
+// @description  NJT-jogszabályok teljes szövegének automatikus betöltése (Ctrl+F-hez) és másolása Wordbe illeszthető formázással vagy Markdownként.
 // @homepageURL  https://github.com/danzig666/njt-copy
 // @downloadURL  https://raw.githubusercontent.com/danzig666/njt-copy/main/njt-copy-jogszabaly.user.js
 // @updateURL    https://raw.githubusercontent.com/danzig666/njt-copy/main/njt-copy-jogszabaly.user.js
@@ -131,9 +131,10 @@
         '.modal',
         '.overlay',
         '.footnote',                         // footnote containers at end of document
-        'a.resource_link',                   // PDF attachment links (remove entirely)
-        'a.resource',                        // PDF attachment links (remove entirely)
     ];
+
+    /** Links kept as hyperlinks (absolute URL): PDF attachments (mellékletek) */
+    var KEEP_LINK_SELECTOR = 'a.resource_link[href], a.resource[href]';
 
     /** Footnote superscript selectors to remove */
     var FN_SUP_SELECTORS = [
@@ -435,10 +436,15 @@
 
         // 5. Remove all <a> link elements — unwrap them to keep the text
         //    and its formatting (bold, italic, etc.) but drop the hyperlink.
+        //    Attachment (PDF) links are kept with an absolute href.
         var links = clone.querySelectorAll('a');
         for (var l = links.length - 1; l >= 0; l--) {
             var link = links[l];
             if (!link.parentNode) continue;
+            if (link.matches(KEEP_LINK_SELECTOR)) {
+                keepAttachmentLink(link);
+                continue;
+            }
             while (link.firstChild) {
                 link.parentNode.insertBefore(link.firstChild, link);
             }
@@ -685,6 +691,35 @@
         }
     }
 
+    /**
+     * Keep an attachment link with an absolute href.  Some wrap the whole
+     * melléklet heading (<a><p>…</p></a>); move the link inside each block
+     * so Word and Markdown get an ordinary inline hyperlink.
+     */
+    function keepAttachmentLink(link) {
+        var href = toAbsoluteUrl(link.getAttribute('href'));
+        var doc = link.ownerDocument;
+        var blocks = [];
+        for (var c = link.firstElementChild; c; c = c.nextElementSibling) {
+            if (/^(P|DIV|H[1-6]|LI|BLOCKQUOTE)$/i.test(c.tagName)) blocks.push(c);
+        }
+        if (!blocks.length) {
+            var a = doc.createElement('a');
+            a.setAttribute('href', href);
+            while (link.firstChild) a.appendChild(link.firstChild);
+            link.parentNode.replaceChild(a, link);
+            return;
+        }
+        for (var b = 0; b < blocks.length; b++) {
+            var inner = doc.createElement('a');
+            inner.setAttribute('href', href);
+            while (blocks[b].firstChild) inner.appendChild(blocks[b].firstChild);
+            blocks[b].appendChild(inner);
+        }
+        while (link.firstChild) link.parentNode.insertBefore(link.firstChild, link);
+        link.parentNode.removeChild(link);
+    }
+
     /** Remove elements that became empty (no text, no children) after stripping */
     function cleanEmptyElements(root) {
         var walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
@@ -784,6 +819,9 @@
 
             // Inline elements: pass text up to parent
             if (!isBlock) {
+                if (tag === 'A' && node.getAttribute('href')) {
+                    return childText + ' <' + node.getAttribute('href') + '>';
+                }
                 return childText;
             }
 
@@ -794,6 +832,173 @@
 
         // Collapse excessive blank lines
         return lines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+    }
+
+    // -----------------------------------------------------------------------
+    // Markdown extraction from the cleaned clone
+    // -----------------------------------------------------------------------
+
+    var MD_BLOCK_TAGS = /^(H[1-6]|P|DIV|LI|UL|OL|DL|DT|DD|SECTION|ARTICLE|BLOCKQUOTE|PRE|HR|TABLE|THEAD|TBODY|TFOOT|TR|TD|TH|CAPTION)$/;
+    var MD_BR = '\u0000';
+
+    function isMdBlock(node) {
+        return node.nodeType === Node.ELEMENT_NODE && MD_BLOCK_TAGS.test(node.tagName.toUpperCase());
+    }
+
+    function hasMdBlockChild(el) {
+        for (var c = el.firstElementChild; c; c = c.nextElementSibling) {
+            if (isMdBlock(c)) return true;
+        }
+        return false;
+    }
+
+    function mdEscape(text) {
+        // Brackets stay as-is: "[A törvény hatálya]" is literal text in Markdown
+        return text.replace(/([\\`*])/g, '\\$1');
+    }
+
+    /** Wrap in emphasis markers, keeping surrounding whitespace outside */
+    function mdEmphasis(marker, s) {
+        var m = s.match(/^(\s*)([\s\S]*?)(\s*)$/);
+        if (!m[2] || m[2] === MD_BR) return s;
+        return m[1] + marker + m[2] + marker + m[3];
+    }
+
+    /**
+     * Inline Markdown for a node.  `bold` / `italic` say whether an ancestor
+     * already applies that emphasis, so nested markers are not repeated.
+     */
+    function mdInline(node, bold, italic) {
+        if (node.nodeType === Node.TEXT_NODE) {
+            return mdEscape(node.textContent.replace(/\s+/g, ' '));
+        }
+        if (node.nodeType !== Node.ELEMENT_NODE) return '';
+        var tag = node.tagName.toUpperCase();
+        if (tag === 'BR') return MD_BR;
+        if (tag === 'IMG') {
+            var src = node.getAttribute('src');
+            return src ? '![' + mdEscape(node.getAttribute('alt') || '') + '](' + src + ')' : '';
+        }
+        // Bold / italic from tags or from inline style set by normalizeForWord()
+        var st = node.getAttribute('style') || '';
+        var isBold = !bold && (tag === 'B' || tag === 'STRONG' || /font-weight\s*:\s*bold/i.test(st));
+        var isItalic = !italic && (tag === 'I' || tag === 'EM' || /font-style\s*:\s*italic/i.test(st));
+        var s = '';
+        for (var c = node.firstChild; c; c = c.nextSibling) {
+            s += mdInline(c, bold || isBold, italic || isItalic);
+        }
+        if (tag === 'SUP' || tag === 'SUB') {
+            if (s.trim()) s = '<' + tag.toLowerCase() + '>' + s + '</' + tag.toLowerCase() + '>';
+        } else if (tag === 'A' && node.getAttribute('href') && s.trim()) {
+            s = '[' + s.trim() + '](' + node.getAttribute('href') + ')';
+        } else if (isMdBlock(node)) {
+            s = ' ' + s + ' ';
+        }
+        if (isItalic) s = mdEmphasis('*', s);
+        if (isBold) s = mdEmphasis('**', s);
+        return s;
+    }
+
+    /** Tidy an inline run into one paragraph; `br` replaces line breaks */
+    function mdParagraph(s, br) {
+        var lines = s.split(MD_BR).map(function (line) {
+            return line.replace(/\s+/g, ' ').trim();
+        }).filter(function (line, i, arr) {
+            return line || (i > 0 && i < arr.length - 1);
+        });
+        return lines.join(br).trim()
+            // Merge neighbouring bold runs: "**a** **b**" -> "**a b**", "**a****b**" -> "**ab**"
+            .replace(/(\\\*|[^*\s])\*\*( ?)\*\*(?=[^*\s])/g, '$1$2');
+    }
+
+    /** Don't let "1. …", "- …", "# …" at the start of a paragraph become a list / heading */
+    function mdEscapeBlockStart(text) {
+        return text.replace(/^(\d+)\.(\s)/, '$1\\.$2').replace(/^([#>+-])(\s)/, '\\$1$2');
+    }
+
+    function mdTable(table) {
+        var grid = [];
+        var rows = table.rows;
+        for (var r = 0; r < rows.length; r++) {
+            grid[r] = grid[r] || [];
+            var col = 0;
+            for (var c = 0; c < rows[r].cells.length; c++) {
+                var cell = rows[r].cells[c];
+                while (grid[r][col] !== undefined) col++;
+                var text = mdBlocks(cell).join(MD_BR);
+                text = mdParagraph(text, '<br>').replace(/\n/g, '<br>').replace(/\|/g, '\\|');
+                var rs = Math.max(1, parseInt(cell.getAttribute('rowspan'), 10) || 1);
+                var cs = Math.max(1, parseInt(cell.getAttribute('colspan'), 10) || 1);
+                for (var dr = 0; dr < rs; dr++) {
+                    grid[r + dr] = grid[r + dr] || [];
+                    for (var dc = 0; dc < cs; dc++) {
+                        grid[r + dr][col + dc] = (dr === 0 && dc === 0) ? text : '';
+                    }
+                }
+                col += cs;
+            }
+        }
+        var width = 0;
+        for (var g = 0; g < grid.length; g++) width = Math.max(width, grid[g].length);
+        if (!width) return '';
+        var out = [];
+        for (var i = 0; i < grid.length; i++) {
+            var cells = [];
+            for (var j = 0; j < width; j++) cells.push(grid[i][j] || '');
+            out.push('| ' + cells.join(' | ') + ' |');
+            if (i === 0) {
+                var sep = [];
+                for (var k = 0; k < width; k++) sep.push('---');
+                out.push('| ' + sep.join(' | ') + ' |');
+            }
+        }
+        return out.join('\n');
+    }
+
+    /** Convert an element's content to a list of Markdown blocks */
+    function mdBlocks(el) {
+        var out = [];
+        var run = '';
+        function flush() {
+            var p = mdEscapeBlockStart(mdParagraph(run, '  \n'));
+            if (p) out.push(p);
+            run = '';
+        }
+        for (var c = el.firstChild; c; c = c.nextSibling) {
+            if (!isMdBlock(c)) {
+                run += mdInline(c);
+                continue;
+            }
+            flush();
+            var tag = c.tagName.toUpperCase();
+            if (tag === 'TABLE') {
+                var t = mdTable(c);
+                if (t) out.push(t);
+            } else if (tag === 'HR') {
+                out.push('---');
+            } else if (/^H[1-6]$/.test(tag)) {
+                var h = mdParagraph(mdInline(c, true, false), ' ');
+                if (h) out.push(new Array(parseInt(tag.charAt(1), 10) + 1).join('#') + ' ' + h);
+            } else if (tag === 'UL' || tag === 'OL') {
+                var n = 0;
+                for (var li = c.firstElementChild; li; li = li.nextElementSibling) {
+                    var item = mdBlocks(li).join('\n').replace(/\n/g, '\n   ');
+                    if (!item) continue;
+                    out.push((tag === 'OL' ? (++n) + '. ' : '- ') + item);
+                }
+            } else if (hasMdBlockChild(c)) {
+                out = out.concat(mdBlocks(c));
+            } else {
+                var p = mdEscapeBlockStart(mdParagraph(mdInline(c), '  \n'));
+                if (p) out.push(p);
+            }
+        }
+        flush();
+        return out;
+    }
+
+    function extractMarkdown(clone) {
+        return mdBlocks(clone).join('\n\n').replace(/\n{3,}/g, '\n\n').trim() + '\n';
     }
 
     // -----------------------------------------------------------------------
@@ -845,43 +1050,68 @@
     var BUTTON_ID = 'njt-copy-word-btn';
     var TOAST_ID = 'njt-copy-toast';
 
-    /** Create or get the copy button */
+    var BTN_BG = '#1a5c8a';
+    var BTN_BG_HOVER = '#1e6ea8';
+
+    /** Create or get the copy button group (Word | MD), same footprint as one button */
     function getOrCreateButton() {
         var existing = document.getElementById(BUTTON_ID);
         if (existing) return existing;
 
-        var btn = document.createElement('button');
-        btn.id = BUTTON_ID;
-        btn.textContent = 'Másolás Word-be';
-        btn.title = 'A teljes jogszabály szövegének másolása vágólapra Word-be illeszthető formátumban.\nBeszúrás után Wordben válaszd a "Forrásformátum megőrzése" lehetőséget!';
-        btn.setAttribute('aria-label', 'Jogszabály másolása Word formátumban');
-        btn.style.cssText = [
+        var group = document.createElement('div');
+        group.id = BUTTON_ID;
+        group.setAttribute('role', 'group');
+        group.style.cssText = [
             'position: fixed',
             'bottom: 24px',
             'right: 24px',
             'z-index: 99999',
-            'padding: 10px 20px',
-            'background: #1a5c8a',
+            'display: flex',
+            'border-radius: 6px',
+            'overflow: hidden',
+            'box-shadow: 0 2px 8px rgba(0,0,0,0.3)',
+            'transition: opacity 0.2s',
+        ].join(';');
+
+        group.appendChild(createCopyButton('word', 'Word-be',
+            'A teljes jogszabály szövegének másolása vágólapra Word-be illeszthető formátumban.\nBeszúrás után Wordben válaszd a "Forrásformátum megőrzése" lehetőséget!',
+            'Jogszabály másolása Word formátumban'));
+        group.appendChild(createCopyButton('md', 'MD-be',
+            'A teljes jogszabály szövegének másolása vágólapra Markdown formátumban.',
+            'Jogszabály másolása Markdown formátumban'));
+
+        document.body.appendChild(group);
+        return group;
+    }
+
+    function createCopyButton(format, label, title, ariaLabel) {
+        var btn = document.createElement('button');
+        btn.textContent = label;
+        btn.title = title;
+        btn.setAttribute('aria-label', ariaLabel);
+        btn.style.cssText = [
+            'padding: 10px ' + (format === 'md' ? '10px' : '12px'),
+            'margin: 0',
+            'background: ' + BTN_BG,
             'color: #fff',
             'border: none',
-            'border-radius: 6px',
+            format === 'md' ? 'border-left: 1px solid rgba(255,255,255,0.4)' : '',
+            'border-radius: 0',
             'font-size: 14px',
             'font-family: Arial, sans-serif',
             'cursor: pointer',
-            'box-shadow: 0 2px 8px rgba(0,0,0,0.3)',
-            'transition: background 0.2s, opacity 0.2s',
-        ].join(';');
+            'transition: background 0.2s',
+        ].filter(Boolean).join(';');
 
         btn.addEventListener('mouseenter', function () {
-            btn.style.background = '#1e6ea8';
+            btn.style.background = BTN_BG_HOVER;
         });
         btn.addEventListener('mouseleave', function () {
-            btn.style.background = '#1a5c8a';
+            btn.style.background = BTN_BG;
         });
-
-        btn.addEventListener('click', handleCopyClick);
-
-        document.body.appendChild(btn);
+        btn.addEventListener('click', function (e) {
+            handleCopyClick(e, format);
+        });
         return btn;
     }
 
@@ -928,26 +1158,18 @@
     }
 
     function setButtonProgress(inProgress) {
-        var btn = document.getElementById(BUTTON_ID);
-        if (!btn) return;
-        if (inProgress) {
-            btn.textContent = 'Szöveg betöltése...';
-            btn.style.opacity = '0.7';
-            btn.style.pointerEvents = 'none';
-            btn.style.cursor = 'wait';
-        } else {
-            btn.textContent = 'Másolás Word-be';
-            btn.style.opacity = '1';
-            btn.style.pointerEvents = 'auto';
-            btn.style.cursor = 'pointer';
-        }
+        var group = document.getElementById(BUTTON_ID);
+        if (!group) return;
+        group.style.opacity = inProgress ? '0.7' : '1';
+        group.style.pointerEvents = inProgress ? 'none' : 'auto';
+        group.style.cursor = inProgress ? 'wait' : '';
     }
 
     // -----------------------------------------------------------------------
     // Main copy handler
     // -----------------------------------------------------------------------
 
-    function handleCopyClick(e) {
+    function handleCopyClick(e, format) {
         e.preventDefault();
         e.stopPropagation();
 
@@ -984,19 +1206,23 @@
                 // focus while loading (user switched away), wait for
                 // focus to return before writing.
                 showToast('Másolás vágólapra...');
-                var contentHtml = cleaned.outerHTML || cleaned.innerHTML;
-                var plainText = extractPlainText(cleaned);
-
                 if (typeof ClipboardItem !== 'function' || !navigator.clipboard || !navigator.clipboard.write) {
                     throw new Error('A böngésző nem támogatja a vágólap API-t');
                 }
 
-                var blobHtml = new Blob([contentHtml], { type: 'text/html' });
-                var blobText = new Blob([plainText], { type: 'text/plain' });
-                var item = new ClipboardItem({
-                    'text/html': blobHtml,
-                    'text/plain': blobText,
-                });
+                var item;
+                if (format === 'md') {
+                    item = new ClipboardItem({
+                        'text/plain': new Blob([extractMarkdown(cleaned)], { type: 'text/plain' }),
+                    });
+                } else {
+                    var contentHtml = cleaned.outerHTML || cleaned.innerHTML;
+                    var plainText = extractPlainText(cleaned);
+                    item = new ClipboardItem({
+                        'text/html': new Blob([contentHtml], { type: 'text/html' }),
+                        'text/plain': new Blob([plainText], { type: 'text/plain' }),
+                    });
+                }
 
                 // Promise-based retry loop with focus detection
                 return new Promise(function (resolve, reject) {
@@ -1026,7 +1252,9 @@
                 });
             })
             .then(function () {
-                showToast('Kész! Illeszd be Wordbe (Ctrl+V), majd válaszd a "Forrásformátum megőrzése" lehetőséget!');
+                showToast(format === 'md'
+                    ? 'Kész! A Markdown szöveg a vágólapon (Ctrl+V).'
+                    : 'Kész! Illeszd be Wordbe (Ctrl+V), majd válaszd a "Forrásformátum megőrzése" lehetőséget!');
             })
             .catch(function (err) {
                 console.error('[NJT Copy] Hiba:', err);
